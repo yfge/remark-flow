@@ -1,0 +1,49 @@
+{
+  "name": "remark-flow",
+  "version": "1.0.0-alpha.8",
+  "description": "Remark plugins for custom button and variable syntax transformation",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc --build --clean && tsc --build",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "remark",
+    "remark-plugin",
+    "markdown",
+    "custom-variable"
+  ],
+  "author": "remark-flow contributors",
+  "homepage": "https://github.com/ai-shifu/remark-flow#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ai-shifu/remark-flow.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ai-shifu/remark-flow/issues"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "unist": "^0.0.1",
+    "unist-util-visit": "^5.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "jest": "^29.0.0",
+    "@types/jest": "^29.0.0",
+    "ts-jest": "^29.0.0",
+    "@types/unist": "^3.0.0",
+    "remark": "^15.0.0",
+    "remark-parse": "^11.0.0",
+    "unified": "^11.0.0"
+  }
+}
