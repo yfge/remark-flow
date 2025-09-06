@@ -4,58 +4,49 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  workflow_dispatch:
 
 jobs:
-  test:
+  release:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run linting
-        run: npm run lint
-
-      - name: Run format check
-        run: npm run format:check
-
-      - name: Run markdown linting
-        run: npm run lint:md
-
-      - name: Run tests
-        run: npm run test:coverage
-
-      - name: Build package
-        run: npm run build
-
-  version:
-    runs-on: ubuntu-latest
-    needs: test
-    if: "!contains(github.event.head_commit.message, 'chore(release)')"
     permissions:
       contents: write
-      pull-requests: write
       issues: write
-    outputs:
-      new_version: ${{ steps.version.outputs.new_version }}
-      has_changes: ${{ steps.version.outputs.has_changes }}
+      pull-requests: write
+      id-token: write
+
     steps:
-      - name: Checkout code
+      - name: Check out repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Fetch upstream changes
+        run: |
+          # Add upstream remote if it doesn't exist
+          git remote add upstream https://github.com/ai-shifu/remark-flow.git || true
+          git fetch upstream
+          
+          # Check if we're working with main or need to sync
+          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          echo "Current branch: $CURRENT_BRANCH"
+          
+          if [ "$CURRENT_BRANCH" = "main" ]; then
+            echo "Already on main, syncing with upstream..."
+            git merge upstream/main --ff-only || {
+              echo "Fast-forward merge failed, rebasing..."
+              git rebase upstream/main
+            }
+          else
+            echo "Switching to upstream/main..."
+            git checkout upstream/main
+            git checkout -b release-$(date +%Y%m%d-%H%M%S)
+          fi
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -64,213 +55,174 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Run tests and build
+        run: |
+          npm run lint
+          npm run format:check
+          npm test
+          npm run build
 
       - name: Configure Git
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
 
-      - name: Check for conventional commits since last release
-        id: check_commits
+      - name: Check for version bump needed
+        id: check-version
         run: |
-          # Get the latest published version from npm
+          echo "🔍 Checking for conventional commits that warrant version bump..."
+          
+          # Get the latest npm published version
           LATEST_NPM_VERSION=$(npm view remark-flow version 2>/dev/null || echo "")
-
-          if [ -z "$LATEST_NPM_VERSION" ]; then
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-            echo "No published version found on npm, creating first release"
-            echo "npm_version=" >> $GITHUB_OUTPUT
+          echo "Latest npm version: $LATEST_NPM_VERSION"
+          
+          # Get the latest git tag
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "Last git tag: $LAST_TAG"
+          
+          # Check commits since last tag or npm version
+          if [ -n "$LAST_TAG" ]; then
+            COMMITS=$(git log ${LAST_TAG}..HEAD --oneline | grep -E "^[a-f0-9]+ (feat|fix|BREAKING CHANGE)" || true)
+            RANGE="${LAST_TAG}..HEAD"
+          elif [ -n "$LATEST_NPM_VERSION" ]; then
+            # If no git tags but npm version exists, check all commits
+            COMMITS=$(git log --oneline | grep -E "^[a-f0-9]+ (feat|fix|BREAKING CHANGE)" || true)
+            RANGE="HEAD"
           else
-            echo "Latest npm version: $LATEST_NPM_VERSION"
-
-            # Find the git tag corresponding to the npm version
-            NPM_TAG="v$LATEST_NPM_VERSION"
-            if git rev-parse "$NPM_TAG" >/dev/null 2>&1; then
-              echo "Found corresponding git tag: $NPM_TAG"
-              COMMITS=$(git log ${NPM_TAG}..HEAD --oneline | grep -E "^[a-f0-9]+ (feat|fix|BREAKING CHANGE)" || true)
-            else
-              echo "No git tag found for npm version, checking all commits"
-              COMMITS=$(git log --oneline | grep -E "^[a-f0-9]+ (feat|fix|BREAKING CHANGE)" || true)
-            fi
-
-            if [ -n "$COMMITS" ]; then
-              echo "has_changes=true" >> $GITHUB_OUTPUT
-              echo "Found commits requiring version bump since npm version $LATEST_NPM_VERSION:"
-              echo "$COMMITS"
-            else
-              echo "has_changes=false" >> $GITHUB_OUTPUT
-              echo "No conventional commits found since npm version $LATEST_NPM_VERSION"
-            fi
+            # No previous releases, check all commits
+            COMMITS=$(git log --oneline | grep -E "^[a-f0-9]+ (feat|fix|BREAKING CHANGE)" || true)
+            RANGE="HEAD"
+          fi
+          
+          echo "Commit range: $RANGE"
+          echo "Found commits:"
+          echo "$COMMITS"
+          
+          if [ -n "$COMMITS" ]; then
+            echo "bump_needed=true" >> $GITHUB_OUTPUT
+            echo "commit_range=$RANGE" >> $GITHUB_OUTPUT
             echo "npm_version=$LATEST_NPM_VERSION" >> $GITHUB_OUTPUT
+          else
+            echo "bump_needed=false" >> $GITHUB_OUTPUT
+            echo "No conventional commits found, skipping release"
           fi
 
-      - name: Install standard-version
-        if: steps.check_commits.outputs.has_changes == 'true'
-        run: npm install -g standard-version
-
-      - name: Bump version and create tag
+      - name: Determine new version and generate changelog
         id: version
-        if: steps.check_commits.outputs.has_changes == 'true'
+        if: steps.check-version.outputs.bump_needed == 'true'
         run: |
-          NPM_VERSION="${{ steps.check_commits.outputs.npm_version }}"
-
+          NPM_VERSION="${{ steps.check-version.outputs.npm_version }}"
+          COMMIT_RANGE="${{ steps.check-version.outputs.commit_range }}"
+          
+          # Determine new version based on conventional commits
           if [ -z "$NPM_VERSION" ]; then
-            echo "Creating first release from standard version 1.0.0..."
-            # Update package.json to standard version first
-            npm version 1.0.0 --no-git-tag-version
-            standard-version --first-release
+            echo "Creating first release version 1.0.0..."
+            NEW_VERSION="1.0.0"
+            npm version $NEW_VERSION --no-git-tag-version
           else
-            echo "Creating new version based on npm version: $NPM_VERSION"
+            echo "Bumping version from npm version: $NPM_VERSION"
             
-            # If npm version contains alpha/beta/rc, convert to standard version
+            # Convert alpha versions to standard versions
             if [[ "$NPM_VERSION" == *"alpha"* ]] || [[ "$NPM_VERSION" == *"beta"* ]] || [[ "$NPM_VERSION" == *"rc"* ]]; then
-              echo "Converting prerelease version $NPM_VERSION to standard version"
-              # Extract base version (e.g., 1.0.0-alpha.7 -> 1.0.0)
               BASE_VERSION=$(echo "$NPM_VERSION" | sed 's/-.*$//')
-              echo "Using base version: $BASE_VERSION"
+              echo "Converting prerelease $NPM_VERSION to standard version $BASE_VERSION"
               npm version $BASE_VERSION --no-git-tag-version
             else
-              echo "Using standard npm version: $NPM_VERSION"
               npm version $NPM_VERSION --no-git-tag-version
             fi
             
-            standard-version
+            # Check commit types to determine version bump
+            if git log $COMMIT_RANGE --oneline | grep -q "BREAKING CHANGE"; then
+              NEW_VERSION=$(npm version major --no-git-tag-version)
+            elif git log $COMMIT_RANGE --oneline | grep -q "^[a-f0-9]+ feat"; then
+              NEW_VERSION=$(npm version minor --no-git-tag-version)
+            else
+              NEW_VERSION=$(npm version patch --no-git-tag-version)
+            fi
+            
+            NEW_VERSION=$(node -p "require('./package.json').version")
           fi
-
-          NEW_VERSION=$(node -p "require('./package.json').version")
+          
           echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
-          echo "has_changes=true" >> $GITHUB_OUTPUT
+          echo "New version: $NEW_VERSION"
+          
+          # Generate incremental changelog (only commits since last release)
+          CHANGELOG_CONTENT=""
+          if [ "$COMMIT_RANGE" != "HEAD" ]; then
+            echo "Generating changelog for range: $COMMIT_RANGE"
+            CHANGELOG_CONTENT=$(git log $COMMIT_RANGE --pretty=format:"- %s (%h)" --grep="^feat" --grep="^fix" --grep="BREAKING CHANGE" --perl-regexp | head -20)
+          else
+            echo "Generating changelog for all commits"
+            CHANGELOG_CONTENT=$(git log --pretty=format:"- %s (%h)" --grep="^feat" --grep="^fix" --grep="BREAKING CHANGE" --perl-regexp | head -20)
+          fi
+          
+          if [ -z "$CHANGELOG_CONTENT" ]; then
+            CHANGELOG_CONTENT="- Various improvements and bug fixes"
+          fi
+          
+          # Save changelog content
+          echo "changelog_content<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG_CONTENT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          # Create git tag
+          git tag "v$NEW_VERSION" -m "Release v$NEW_VERSION"
 
-          # Push changes and tags
-          git push origin main
+      - name: Push changes and tags
+        if: steps.check-version.outputs.bump_needed == 'true'
+        run: |
+          git push origin HEAD:main
           git push --tags
 
-  build:
-    runs-on: ubuntu-latest
-    needs: version
-    if: needs.version.outputs.has_changes == 'true'
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: v${{ needs.version.outputs.new_version }}
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build package
-        run: npm run build
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
-          retention-days: 1
-
-  publish:
-    runs-on: ubuntu-latest
-    needs: [version, build]
-    if: needs.version.outputs.has_changes == 'true'
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: v${{ needs.version.outputs.new_version }}
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
-
       - name: Check if version exists on npm
-        id: check_version
+        id: check-npm
+        if: steps.check-version.outputs.bump_needed == 'true'
         run: |
-          PACKAGE_NAME=$(node -p "require('./package.json').name")
-          if npm view $PACKAGE_NAME@${{ needs.version.outputs.new_version }} version 2>/dev/null; then
+          PACKAGE_NAME="remark-flow"
+          NEW_VERSION="${{ steps.version.outputs.new_version }}"
+          
+          if npm view $PACKAGE_NAME@$NEW_VERSION version 2>/dev/null; then
             echo "exists=true" >> $GITHUB_OUTPUT
-            echo "Version ${{ needs.version.outputs.new_version }} already exists on npm"
+            echo "Version $NEW_VERSION already exists on npm"
           else
             echo "exists=false" >> $GITHUB_OUTPUT
-            echo "Version ${{ needs.version.outputs.new_version }} does not exist on npm"
+            echo "Version $NEW_VERSION does not exist on npm"
           fi
 
       - name: Publish to npm
-        if: steps.check_version.outputs.exists == 'false'
-        run: npm publish
+        if: steps.check-version.outputs.bump_needed == 'true' && steps.check-npm.outputs.exists == 'false'
+        run: |
+          # Set up npm authentication
+          echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > ~/.npmrc
+          
+          # Publish package
+          npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Skip publish if version exists
-        if: steps.check_version.outputs.exists == 'true'
-        run: echo "Skipping npm publish - version ${{ needs.version.outputs.new_version }} already exists"
-
-  release:
-    runs-on: ubuntu-latest
-    needs: [version, publish]
-    if: needs.version.outputs.has_changes == 'true'
-    permissions:
-      contents: write
-      pull-requests: read
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: v${{ needs.version.outputs.new_version }}
-
-      - name: Generate release notes from changelog
-        id: changelog
-        run: |
-          VERSION="${{ needs.version.outputs.new_version }}"
-          if [ -f CHANGELOG.md ]; then
-            # Extract the latest version section from CHANGELOG.md
-            VERSION_SECTION=$(sed -n "/## \[${VERSION}\]/,/## \[/p" CHANGELOG.md | sed '$d')
-            if [ -n "$VERSION_SECTION" ]; then
-              echo "release_notes<<EOF" >> $GITHUB_OUTPUT
-              echo "$VERSION_SECTION" >> $GITHUB_OUTPUT
-              echo "EOF" >> $GITHUB_OUTPUT
-            else
-              echo "release_notes=Release v$VERSION" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "release_notes=Release v$VERSION" >> $GITHUB_OUTPUT
-          fi
-
       - name: Create GitHub Release
+        if: steps.check-version.outputs.bump_needed == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ needs.version.outputs.new_version }}
-          name: Release v${{ needs.version.outputs.new_version }}
+          tag_name: v${{ steps.version.outputs.new_version }}
+          name: Release v${{ steps.version.outputs.new_version }}
           body: |
             ## 📦 Package Information
             - **Package**: [remark-flow](https://www.npmjs.com/package/remark-flow)
-            - **Version**: ${{ needs.version.outputs.new_version }}
-            - **Installation**: `npm install remark-flow@${{ needs.version.outputs.new_version }}`
+            - **Version**: ${{ steps.version.outputs.new_version }}
+            - **Installation**: `npm install remark-flow@${{ steps.version.outputs.new_version }}`
 
-            ## 📝 Changes
-            ${{ steps.changelog.outputs.release_notes }}
+            ## 📝 What's Changed
+            ${{ steps.version.outputs.changelog_content }}
 
             ## 🔗 Links
-            - [NPM Package](https://www.npmjs.com/package/remark-flow/v/${{ needs.version.outputs.new_version }})
+            - [NPM Package](https://www.npmjs.com/package/remark-flow/v/${{ steps.version.outputs.new_version }})
             - [Documentation](https://github.com/${{ github.repository }}#readme)
             - [Issues](https://github.com/${{ github.repository }}/issues)
+
+            ---
+            *This release was automatically generated from conventional commits.*
           draft: false
           prerelease: false
           token: ${{ secrets.GITHUB_TOKEN }}
