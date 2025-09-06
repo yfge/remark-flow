@@ -121,8 +121,19 @@ jobs:
             standard-version --first-release
           else
             echo "Creating new version based on npm version: $NPM_VERSION"
-            # Update package.json to match npm version first, then bump
-            npm version $NPM_VERSION --no-git-tag-version
+            
+            # If npm version contains alpha/beta/rc, convert to standard version
+            if [[ "$NPM_VERSION" == *"alpha"* ]] || [[ "$NPM_VERSION" == *"beta"* ]] || [[ "$NPM_VERSION" == *"rc"* ]]; then
+              echo "Converting prerelease version $NPM_VERSION to standard version"
+              # Extract base version (e.g., 1.0.0-alpha.7 -> 1.0.0)
+              BASE_VERSION=$(echo "$NPM_VERSION" | sed 's/-.*$//')
+              echo "Using base version: $BASE_VERSION"
+              npm version $BASE_VERSION --no-git-tag-version
+            else
+              echo "Using standard npm version: $NPM_VERSION"
+              npm version $NPM_VERSION --no-git-tag-version
+            fi
+            
             standard-version
           fi
 
